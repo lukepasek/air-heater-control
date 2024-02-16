@@ -7,7 +7,7 @@
 #define LED_PIN 2
 #define OUT_PIN 18
 #define OUT_GND_PIN 19
-#define BW_SERIAL_RX_PIN 5
+#define BW_SERIAL_PIN 5
 #define BW_SERIAL_IDLE_LEVEL LOW
 
 #define BW_SERLIAL_BPS 250
@@ -20,25 +20,29 @@
 
 hw_timer_t *blueWireSerialTimer = NULL;
 
-volatile boolean new_bit = false;
-volatile int bit_cnt = 0;
-volatile int sample_cnt = 0;
-volatile uint8_t rx_bit = 0;
-volatile boolean start_bit = false;
-
+volatile int rx_sample_cnt = 0;
 volatile uint16_t rx_byte_msbf;
-// volatile uint16_t rx_byte_lsbf;
-
 volatile boolean new_rx_char = false;
 volatile boolean rx_sample_enable = false;
 
-void reset_rx_byte()
-{
-  bit_cnt = 0;
-  sample_cnt = 3;
-  // rx_byte_lsbf = 0;
-  rx_byte_msbf = 0;
-}
+uint8_t rx_frame_buffer[6];
+int rx_frame_ptr = 0;
+uint8_t tx_frame;
+
+uint16_t last_frame_buffer[8];
+int last_frame_ptr = 0;
+
+unsigned long txrx_ts = 0;
+unsigned long last_txrx_ts = 0;
+unsigned long last_frame_ts = 0;
+
+long cmd_cnt = 0;
+int no_data_cnt = 0;
+boolean monitor_mode = false;
+
+boolean rx_process();
+void print_frame();
+void print_byte(int idx, uint16_t value, uint16_t last_value, const char *color);
 
 void led_on(boolean on)
 {
@@ -48,55 +52,61 @@ void led_on(boolean on)
 
 void IRAM_ATTR serialPinEdgeISR()
 {
-  int rx_state = digitalRead(BW_SERIAL_RX_PIN);
-  if (rx_state)
+  if (digitalRead(BW_SERIAL_PIN))
   {
-    detachInterrupt(BW_SERIAL_RX_PIN);
     timerWrite(blueWireSerialTimer, 0);
-    reset_rx_byte();
+    detachInterrupt(BW_SERIAL_PIN);
+    rx_sample_cnt = 0;
+    rx_byte_msbf = 0;
     rx_sample_enable = true;
+    // led_on(HIGH);
+  }
+  else
+  {
+    // if (millis() - txrx_ts >= 100) {
+    //   rx_frame_ptr = 0;
+    // }
   }
 }
 
-void sample_end()
-{
-  rx_sample_enable = false;
-  attachInterrupt(BW_SERIAL_RX_PIN, &serialPinEdgeISR, CHANGE);
-}
-
-volatile int bit_value = 0;
 void IRAM_ATTR serialBitTimerISR()
 {
   if (rx_sample_enable)
   {
-    int rx_pin_state = digitalRead(BW_SERIAL_RX_PIN);
-    boolean frame_error = false;
-    int sample_ptr = sample_cnt % 6;
-    if (sample_ptr < 3)
+    int rx_pin_state = digitalRead(BW_SERIAL_PIN);
+    int rx_sample_ptr = rx_sample_cnt % 6;
+    boolean rx_frame_error = false;
+    rx_sample_cnt++;
+
+    // led_on(rx_sample_cnt & 1);
+
+    led_on(HIGH);
+
+    if (rx_sample_ptr == 0)
     {
-      led_on(HIGH);
+      rx_frame_error = rx_pin_state != 1;
     }
-    if (sample_ptr == 1 && rx_pin_state == 1)
-    {
-      frame_error = true;
-    }
-    if (sample_ptr == 3 && rx_pin_state == 0)
-    {
-      frame_error = true;
-    }
-    if (sample_ptr == 5)
+    else if (rx_sample_ptr == 2)
     {
       rx_byte_msbf = (rx_byte_msbf << 1) | rx_pin_state;
     }
-
-    if (frame_error || sample_cnt >= 6 * 8)
+    else if (rx_sample_ptr == 4)
     {
-      sample_end();
-      new_rx_char = !frame_error;
+      rx_frame_error = rx_pin_state != 0;
+    }
+    else
+    {
       led_on(LOW);
+    }
+
+    if (rx_frame_error || rx_sample_cnt >= ((6 * 8) - 2))
+    {
+      led_on(LOW);
+      rx_sample_enable = false;
+      attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
+      new_rx_char = !rx_frame_error;
       return;
     }
-    sample_cnt++;
   }
 }
 
@@ -104,101 +114,103 @@ void setup()
 {
   Serial.begin(115200);
   Serial.println();
-  println_color(COLOR_GREEN, "Air heater protocol monitor");
+  println_color(COLOR_GREEN, "--==## Diesel Air Heater protocol monitor ##==--");
+  println_color(COLOR_GREEN, "Running in monitor mode.");
 
   pinMode(OUT_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
-  pinMode(BW_SERIAL_RX_PIN, INPUT);
+  pinMode(BW_SERIAL_PIN, INPUT);
 
   blueWireSerialTimer = timerBegin(0, 80, true);
   timerAttachInterrupt(blueWireSerialTimer, &serialBitTimerISR, true);
   timerAlarmWrite(blueWireSerialTimer, BW_BIT_SAMPLE_DELAY, true);
   timerAlarmEnable(blueWireSerialTimer);
 
-  attachInterrupt(BW_SERIAL_RX_PIN, &serialPinEdgeISR, CHANGE);
+  attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
 }
 
-unsigned long last_frame_ts = 0;
-
-uint16_t frame_buffer[32];
-int frame_ptr = 0;
-
-uint16_t last_frame_buffer[32];
-int last_frame_ptr = 0;
-
-boolean receive();
-void print_frame();
-void print_byte(int idx, uint16_t value, uint16_t last_value, const char *color);
-
-void send_command(uint8_t command) {
-  detachInterrupt(BW_SERIAL_RX_PIN);
-  pinMode(BW_SERIAL_RX_PIN, OUTPUT);
-  digitalWrite(BW_SERIAL_RX_PIN, LOW);
-  delay(30-4);
-  for (int i = 7; i >=0; i--)
+void send_command(uint8_t command)
+{
+  detachInterrupt(BW_SERIAL_PIN);
+  pinMode(BW_SERIAL_PIN, OUTPUT);
+  digitalWrite(BW_SERIAL_PIN, LOW);
+  delay(30);
+  for (int i = 7; i >= 0; i--)
   {
-    digitalWrite(BW_SERIAL_RX_PIN, LOW);
+    digitalWrite(BW_SERIAL_PIN, HIGH);
     delay(4);
-    digitalWrite(BW_SERIAL_RX_PIN, HIGH);
+    digitalWrite(BW_SERIAL_PIN, (command >> i) & 0x01);
     delay(4);
-    digitalWrite(BW_SERIAL_RX_PIN, (command >> i) & 0x01);
+    digitalWrite(BW_SERIAL_PIN, LOW);
     delay(4);
   }
-  digitalWrite(BW_SERIAL_RX_PIN, LOW);
-  delay(4);
-  digitalWrite(BW_SERIAL_RX_PIN, HIGH);
-  pinMode(BW_SERIAL_RX_PIN, INPUT);
-  attachInterrupt(BW_SERIAL_RX_PIN, &serialPinEdgeISR, CHANGE);
+  digitalWrite(BW_SERIAL_PIN, HIGH);
+  pinMode(BW_SERIAL_PIN, INPUT);
+  attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
 }
 
-unsigned long last_txrx_ts = 0;
-long cmd_cnt = 0;
-int no_data_cnt = 0;
-boolean monitor_mode = true;
 void loop()
 {
-  if (millis() - last_txrx_ts > 500) {
-    if (!monitor_mode) {
-      uint8_t command = 0;
-      // if (cmd_cnt++ == 10)
+  unsigned long now = millis();
+  if (now - txrx_ts > 500)
+  {
+    if (monitor_mode) {
+      // if (no_data_cnt++ >= 10)
       // {
-      //   command = 0xa2;
+
+      //   Serial.print("Monitor mode: No data detected in ");
+      //   Serial.print((now - txrx_ts));
+      //   Serial.println("ms!");
+      //   no_data_cnt = 0;
+      //   // -switching to controller mode ");
+      //   // monitor_mode = false;
       // }
-      // else
-      // {
-        command = 0xa6;
-      // }
-      send_command(command);
-      frame_buffer[0] = command;
-      frame_ptr = 1;
-    } else {
-      frame_ptr = 0;
-    }
-    last_txrx_ts = millis();
-    if (monitor_mode && digitalRead(BW_SERIAL_RX_PIN)) {
-      if (no_data_cnt++>=20) {
-        monitor_mode = false;
-        Serial.println("No data detected - switching to controler mode");
+      if (rx_frame_ptr)
+      {
+        Serial.print("@");
+        Serial.print(now - txrx_ts);
+        Serial.print(":");
+        Serial.println(rx_frame_ptr);
+
+        rx_frame_ptr = 0;
       }
+    } else {
+      uint8_t command;
+      if (cmd_cnt%25==5) {
+        command = 0xae;
+      }
+      else
+      {
+        command = 0xa6;
+      }
+      send_command(command);
+      cmd_cnt++;
+      txrx_ts = millis();
+      Serial.print("> ");
+      rx_frame_buffer[0] = command;
+      rx_frame_ptr = 1;
     }
   }
 
-  boolean new_frame = receive();
-  if (new_frame) {
-    frame_ptr = 0;
-    last_txrx_ts = millis();
+  boolean new_frame = rx_process();
+  if (new_frame)
+  {
+    // txrx_ts = now;
+    print_frame();
+    rx_frame_ptr = 0;
     no_data_cnt = 0;
   }
 }
 
-boolean receive() {
+boolean rx_process()
+{
   if (new_rx_char)
   {
     new_rx_char = false;
-    frame_buffer[frame_ptr++] = rx_byte_msbf;
-    if (frame_ptr >= 3)
+    txrx_ts = millis();
+    rx_frame_buffer[rx_frame_ptr++] = rx_byte_msbf;
+    if (rx_frame_ptr >= 3)
     {
-      print_frame();
       return true;
     }
   }
@@ -233,15 +245,10 @@ void print_byte(int idx, uint16_t value, uint16_t last_value, const char *color)
 int duplicate_frame_cnt = 0;
 void print_frame()
 {
-  if (frame_ptr == 3)
+  if (rx_frame_ptr == 3)
   {
-    if (frame_buffer[0] == 0)
-    {
-      return;
-    }
-    // unsigned long now = millis();
-    // Serial.print(millis());
     boolean frame_diff = false;
+    unsigned long now = millis();
     // if (frame_ptr != last_frame_ptr)
     // {
     //   // frame_diff = true;
@@ -249,9 +256,9 @@ void print_frame()
     // }
     // else
     // {
-    for (int i = 0; i < frame_ptr; i++)
+    for (int i = 0; i < rx_frame_ptr; i++)
     {
-      if (frame_buffer[i] != last_frame_buffer[i])
+      if (rx_frame_buffer[i] != last_frame_buffer[i])
       {
         frame_diff = true;
         break;
@@ -261,40 +268,40 @@ void print_frame()
 
     if (!frame_diff)
     {
-      last_frame_ptr = frame_ptr;
-      for (int i = 0; i < frame_ptr; i++)
+      last_frame_ptr = rx_frame_ptr;
+      for (int i = 0; i < rx_frame_ptr; i++)
       {
-        last_frame_buffer[i] = frame_buffer[i];
+        last_frame_buffer[i] = rx_frame_buffer[i];
       }
       // return;
     }
 
-    Serial.printf("%10lu: ", (millis() - last_frame_ts));
-    // last_frame_ts = now;
+    Serial.printf("%8lu: ", (now - last_frame_ts));
+    last_frame_ts = now;
 
     for (int i = 0; i < 1; i++)
     {
-      print_byte(i, frame_buffer[i], last_frame_buffer[i], frame_diff ? COLOR_BLUE : COLOR_NONE);
+      print_byte(i, rx_frame_buffer[i], last_frame_buffer[i], frame_diff ? COLOR_BLUE : COLOR_NONE);
     }
     Serial.print("| ");
-    for (int i = 1; i < frame_ptr; i++)
+    for (int i = 1; i < rx_frame_ptr; i++)
     {
-      print_byte(i - 1, frame_buffer[i], last_frame_buffer[i], frame_diff ? COLOR_BROWN : COLOR_NONE);
+      print_byte(i - 1, rx_frame_buffer[i], last_frame_buffer[i], frame_diff ? COLOR_BROWN : COLOR_NONE);
     }
 
     Serial.print("| ");
 
-    last_frame_ptr = frame_ptr;
-    for (int i = 0; i < frame_ptr; i++)
+    last_frame_ptr = rx_frame_ptr;
+    for (int i = 0; i < rx_frame_ptr; i++)
     {
-      last_frame_buffer[i] = frame_buffer[i];
+      last_frame_buffer[i] = rx_frame_buffer[i];
     }
 
     // uint8_t reply[2];
-    uint8_t query = frame_buffer[0];
-    uint8_t flags0 = frame_buffer[1];
-    uint8_t flags1 = frame_buffer[2] >> 6;
-    uint8_t value = frame_buffer[2] & 0x3f;
+    uint8_t query = rx_frame_buffer[0];
+    uint8_t flags0 = rx_frame_buffer[1];
+    uint8_t flags1 = rx_frame_buffer[2] >> 6;
+    uint8_t value = rx_frame_buffer[2] & 0x3f;
 
     switch (query)
     {
@@ -386,10 +393,13 @@ void print_frame()
           text_color(COLOR_NONE);
         }
         text_color(COLOR_CYAN);
-        if (value<6) {
+        if (value < 6)
+        {
           Serial.print("H");
           Serial.print(value + 1);
-        } else {
+        }
+        else
+        {
           Serial.print("automatic mode");
         }
         Serial.print(" ");
@@ -607,110 +617,6 @@ void print_frame()
   }
   else
   {
-    Serial.printf("Invalid frame length: %d\n", frame_ptr);
+    Serial.printf("Invalid frame length: %d\n", rx_frame_ptr);
   }
 }
-
-// if (frame_buffer[0] == 0xa6)
-// {
-//   if (frame_buffer[1] != 0x36)
-//   {
-//     Serial.print("* ");
-//   }
-//   else
-//   {
-//     Serial.print("| ");
-//   }
-
-//   if (frame_buffer[1] == 0x26)
-//   {
-//     Serial.print("power toggle ");
-//   }
-//   else if (frame_buffer[1] == 0x24)
-//   {
-//     Serial.print("thermostat toggle ");
-//   }
-//   else if (frame_buffer[1] == 0x36)
-//   {
-//   }
-//   else if (frame_buffer[1] == 0xa6)
-//   {
-//     Serial.print("get status 1 ");
-//   }
-//   else if (frame_buffer[1] == 0xb6)
-//   {
-//     Serial.print("get status 2 ");
-//   }
-// }
-// else if (frame_buffer[0] == 0x36)
-// {
-//   if (frame_buffer[1] == 0xb6)
-//   {
-//     Serial.print("| thermo ");
-//   }
-//   else
-//   {
-//     Serial.print("| thermo ??? ");
-//   }
-//   // Serial.print("| thermostat ");
-// }
-
-// // if (frame_buffer[3] & 0x10)
-// // {
-// //   Serial.print("on ");
-// // }
-
-// // if (frame_buffer[3] == 0xa4)
-// // {
-// //   Serial.print("glow plug ");
-// // }
-
-// // if (frame_buffer[3] == 0xb4)
-// // {
-// //   Serial.print("pump ");
-// // }
-// // else if (frame_buffer[3] == 0x34)
-// // {
-// //   Serial.print("manual pump ");
-// // }
-
-// if (frame_buffer[2] == 0x36)
-// {
-//   if (frame_buffer[5] & 0x80)
-//   {
-//     Serial.print("off ");
-//   }
-//   else
-//   {
-//     Serial.print("on ");
-//   }
-
-//   if (frame_buffer[3] & 0x02)
-//   {
-//     Serial.print("high alt ");
-//   }
-//   if (frame_buffer[3] & 0x10)
-//   {
-//     Serial.print("pump ");
-//   }
-//   if (frame_buffer[3] & 0x80)
-//   {
-//     Serial.print("fan/glow plug? ");
-//   }
-// }
-// else if (frame_buffer[2] == 0x34)
-// {
-//   Serial.print("status 2 data (internal temp)");
-// }
-// else if (frame_buffer[2] == 0xa6)
-// {
-//   Serial.print("status 1 data (voltage)");
-// }
-// else if (frame_buffer[2] == 0xa4)
-// {
-//   Serial.print("error 8");
-// }
-// else
-// {
-//   Serial.print("unknown state");
-// }
