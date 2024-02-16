@@ -38,7 +38,7 @@ unsigned long last_frame_ts = 0;
 
 long cmd_cnt = 0;
 int no_data_cnt = 0;
-boolean monitor_mode = false;
+boolean monitor_mode = true;
 
 boolean rx_process();
 void print_frame();
