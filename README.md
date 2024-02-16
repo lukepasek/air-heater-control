@@ -14,7 +14,7 @@ This new controller (and matching main unit in the heater) communicate using a d
 
 ## Sample of protocol decode
 
-Come data grames already analised and decoded.
+Couple of data frames already analised and decoded.
 
 ```
     8164: 0: 10100110 0xa6 | 0: 01100000 0x60 1: 00001011 0x0b | manual mode | idle 11V
