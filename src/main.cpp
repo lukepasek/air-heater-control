@@ -4,17 +4,16 @@
 
 #include "color_terminal.h"
 
-#define LED_PIN 2
-#define OUT_PIN 18
-#define OUT_GND_PIN 19
-#define BW_SERIAL_PIN 5
-#define BW_SERIAL_IDLE_LEVEL LOW
+// #define LED_PIN 2
+#define LED_PIN 8 // C3 super mini - led on pin 8
+
+#define OUT_PIN 3
+
+#define BW_SERIAL_PIN 2
 
 #define BW_SERLIAL_BPS 250
-#define BW_SERLIAL_BITS 12
 
 #define BW_BIT_SAMPLE_DELAY ((500000 / BW_SERLIAL_BPS))
-// #define BW_BIT_SAMPLE_DELAY ((250000 / BW_SERLIAL_BPS))
 
 // HardwareSerial SerialBlueWire(1);
 
@@ -38,7 +37,7 @@ unsigned long last_frame_ts = 0;
 
 long cmd_cnt = 0;
 int no_data_cnt = 0;
-boolean monitor_mode = true;
+boolean monitor_mode = false;
 
 boolean rx_process();
 void print_frame();
@@ -47,7 +46,7 @@ void print_byte(int idx, uint16_t value, uint16_t last_value, const char *color)
 void led_on(boolean on)
 {
   digitalWrite(OUT_PIN, on);
-  digitalWrite(LED_PIN, on);
+  digitalWrite(LED_PIN, !on);
 }
 
 void IRAM_ATTR serialPinEdgeISR()
@@ -110,12 +109,10 @@ void IRAM_ATTR serialBitTimerISR()
   }
 }
 
+// ----> setup
 void setup()
 {
   Serial.begin(115200);
-  Serial.println();
-  println_color(COLOR_GREEN, "--==## Diesel Air Heater protocol monitor ##==--");
-  println_color(COLOR_GREEN, "Running in monitor mode.");
 
   pinMode(OUT_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
@@ -125,6 +122,19 @@ void setup()
   timerAttachInterrupt(blueWireSerialTimer, &serialBitTimerISR, true);
   timerAlarmWrite(blueWireSerialTimer, BW_BIT_SAMPLE_DELAY, true);
   timerAlarmEnable(blueWireSerialTimer);
+
+  delay(3000);
+  for (int i = 0; i < 6; i++)
+  {
+    led_on(HIGH);
+    delay(100);
+    led_on(LOW);
+    delay(100);
+  }
+
+  Serial.println();
+  println_color(COLOR_GREEN, "--==## Diesel Air Heater protocol monitor ##==--");
+  println_color(COLOR_GREEN, "Running in monitor mode.");
 
   attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
 }
@@ -146,49 +156,77 @@ void send_command(uint8_t command)
   }
   digitalWrite(BW_SERIAL_PIN, HIGH);
   pinMode(BW_SERIAL_PIN, INPUT);
+
   attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
 }
 
+// ----> loop
+unsigned long rx_timeout = 0;
+int no_rx_cnt = 0;
 void loop()
 {
   unsigned long now = millis();
-  if (now - txrx_ts > 500)
-  {
-    if (monitor_mode) {
-      // if (no_data_cnt++ >= 10)
-      // {
+  // Serial.print(".");
 
-      //   Serial.print("Monitor mode: No data detected in ");
-      //   Serial.print((now - txrx_ts));
-      //   Serial.println("ms!");
-      //   no_data_cnt = 0;
-      //   // -switching to controller mode ");
-      //   // monitor_mode = false;
-      // }
+  // led_on(now % 100 == 0);
+  if ((now - rx_timeout) >= 700)
+  {
+    rx_timeout = now;
+    // led_on(LOW);
+    if (monitor_mode)
+    {
+      if ((now - txrx_ts) > 700)
+      {
+        Serial.print(".");
+        if (no_rx_cnt++ >= 20)
+        {
+          no_rx_cnt = 0;
+          Serial.println();
+          Serial.print("Monitor mode: No data detected in ");
+          Serial.print((now - txrx_ts) / 1000);
+          Serial.println("s!");
+          Serial.println("Switching to controller mode.");
+          monitor_mode = false;
+        }
+      }
+
       if (rx_frame_ptr)
       {
-        Serial.print("@");
+        Serial.print("mm@");
         Serial.print(now - txrx_ts);
         Serial.print(":");
         Serial.println(rx_frame_ptr);
 
         rx_frame_ptr = 0;
       }
-    } else {
-      uint8_t command;
-      if (cmd_cnt%25==5) {
-        command = 0xae;
-      }
-      else
+    }
+    else
+    {
+      if (digitalRead(BW_SERIAL_PIN))
       {
-        command = 0xa6;
+        uint8_t command;
+        if (cmd_cnt % 25 == 5)
+        {
+          command = 0xae;
+        }
+        else
+        {
+          command = 0xa6;
+        }
+        Serial.print("cm@");
+        Serial.print(millis());
+        Serial.print(" control frame:");
+        Serial.printf(" 0x%02x ", command);
+        led_on(HIGH);
+        send_command(command);
+        led_on(LOW);
+
+        cmd_cnt++;
+        txrx_ts = millis();
+        Serial.print("> ");
+        rx_frame_buffer[0] = command;
+        rx_frame_ptr = 1;
       }
-      send_command(command);
-      cmd_cnt++;
-      txrx_ts = millis();
-      Serial.print("> ");
-      rx_frame_buffer[0] = command;
-      rx_frame_ptr = 1;
     }
   }
 
@@ -208,6 +246,7 @@ boolean rx_process()
   {
     new_rx_char = false;
     txrx_ts = millis();
+    // Serial.printf(" 0x%02x\n", rx_byte_msbf);
     rx_frame_buffer[rx_frame_ptr++] = rx_byte_msbf;
     if (rx_frame_ptr >= 3)
     {
