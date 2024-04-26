@@ -40,7 +40,7 @@
     Serial.println(S);       \
     Serial.print(COLOR_NONE);
 
-// #define printf_color(FG, SF, S)       \
-//   Serial.print(FG); \
-//   Serial.println(S);         \
+// #define printf_color(FG, SF, S)       
+//   Serial.print(FG); 
+//   Serial.println(S);         
 //   Serial.print(COLOR_NONE);

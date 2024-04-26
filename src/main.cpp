@@ -1,28 +1,77 @@
 #include <Arduino.h>
-
-// #include <HardwareSerial.h>
-
+#include "main.h"
 #include "color_terminal.h"
-
-// #define LED_PIN 2
-#define LED_PIN 8 // C3 super mini - led on pin 8
-
-#define OUT_PIN 3
-
-#define BW_SERIAL_PIN 2
 
 #define BW_SERLIAL_BPS 250
 
-#define BW_BIT_SAMPLE_DELAY ((500000 / BW_SERLIAL_BPS))
-
-// HardwareSerial SerialBlueWire(1);
-
-hw_timer_t *blueWireSerialTimer = NULL;
-
 volatile int rx_sample_cnt = 0;
 volatile uint16_t rx_byte_msbf;
-volatile boolean new_rx_char = false;
-volatile boolean rx_sample_enable = false;
+volatile bool new_rx_char = false;
+volatile bool rx_sample_enable = false;
+
+volatile int bitTimerCount = 0;
+
+#ifdef ESP32
+  #define BW_BIT_SAMPLE_DELAY ((500000 / BW_SERLIAL_BPS))
+  #define LED_PIN 8 // C3 super mini - led on pin 8
+  #define OUT_PIN 3
+  #define BW_SERIAL_PIN 2
+
+  hw_timer_t *SerialBitTimer = NULL;
+
+  void inline initSerialBitTimer() {
+    SerialBitTimer = timerBegin(0, 80, true);
+    timerAttachInterrupt(SerialBitTimer, &serialBitTimerISR, true);
+    timerAlarmWrite(SerialBitTimer, BW_BIT_SAMPLE_DELAY, true);
+    timerAlarmEnable(SerialBitTimer);
+  }
+
+  void inline restartSerialBitTimer() {
+    timerWrite(SerialBitTimer, 0);
+  }
+
+  void inline attachSerialPinInterrupt() {
+    attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
+  }
+
+  void inline detachSerialPinInterrupt() {
+    detachInterrupt(BW_SERIAL_PIN);
+  }
+#endif
+
+#ifdef NRF52840_PROMICRO
+  #define BW_BIT_SAMPLE_DELAY ((500000 / BW_SERLIAL_BPS))
+  #define TIMER_INTERRUPT_DEBUG         0
+  #define _TIMERINTERRUPT_LOGLEVEL_     3
+
+  #include <Adafruit_TinyUSB.h>
+  #include "NRF52TimerInterrupt.h"
+
+  #define LED_PIN LED_BUILTIN // P0.15
+  #define OUT_PIN (10) // P0.10
+  #define BW_SERIAL_PIN (9) // P0.09
+
+  NRF52Timer ITimer0(NRF_TIMER_4);
+
+  void initSerialBitTimer() {
+  }
+
+  void inline stopSerialBitTimer() {
+    ITimer0.detachInterrupt();
+  }
+
+  void inline restartSerialBitTimer() {
+    ITimer0.attachInterruptInterval(BW_BIT_SAMPLE_DELAY, serialBitTimerHandler);
+  }
+
+  void inline attachSerialPinEdgeInterrupt() {
+    attachInterrupt(BW_SERIAL_PIN, serialPinEdgeHandler, CHANGE);
+  }
+
+  void inline detachSerialPinEdgeInterrupt() {
+    detachInterrupt(BW_SERIAL_PIN);
+  }
+#endif
 
 uint8_t rx_frame_buffer[6];
 int rx_frame_ptr = 0;
@@ -37,24 +86,37 @@ unsigned long last_frame_ts = 0;
 
 long cmd_cnt = 0;
 int no_data_cnt = 0;
-boolean monitor_mode = false;
+bool monitor_mode = false;
 
-boolean rx_process();
+bool rx_process();
 void print_frame();
 void print_byte(int idx, uint16_t value, uint16_t last_value, const char *color);
 
-void led_on(boolean on)
+void led_on(bool on)
 {
   digitalWrite(OUT_PIN, on);
   digitalWrite(LED_PIN, !on);
 }
 
+#ifdef ESP32
 void IRAM_ATTR serialPinEdgeISR()
 {
+  serialPinEdgeHandler();
+}  
+
+void IRAM_ATTR serialBitTimerISR() 
+{
+  serialBitTimerHandler();
+}
+#endif
+
+void serialPinEdgeHandler() {
   if (digitalRead(BW_SERIAL_PIN))
   {
-    timerWrite(blueWireSerialTimer, 0);
-    detachInterrupt(BW_SERIAL_PIN);
+    restartSerialBitTimer();
+    detachSerialPinEdgeInterrupt();
+    // timerWrite(SerialBitTimer, 0);
+    // detachInterrupt(BW_SERIAL_PIN);
     rx_sample_cnt = 0;
     rx_byte_msbf = 0;
     rx_sample_enable = true;
@@ -68,44 +130,39 @@ void IRAM_ATTR serialPinEdgeISR()
   }
 }
 
-void IRAM_ATTR serialBitTimerISR()
-{
-  if (rx_sample_enable)
+void serialBitTimerHandler() {
+  int rx_pin_state = digitalRead(BW_SERIAL_PIN);
+  int rx_sample_ptr = rx_sample_cnt % 6;
+  bool rx_frame_error = false;
+  rx_sample_cnt++;
+
+  // led_on(rx_sample_cnt & 1);
+
+  led_on(HIGH);
+
+  if (rx_sample_ptr == 0)
   {
-    int rx_pin_state = digitalRead(BW_SERIAL_PIN);
-    int rx_sample_ptr = rx_sample_cnt % 6;
-    boolean rx_frame_error = false;
-    rx_sample_cnt++;
+    rx_frame_error = rx_pin_state != 1;
+  }
+  else if (rx_sample_ptr == 2)
+  {
+    rx_byte_msbf = (rx_byte_msbf << 1) | rx_pin_state;
+  }
+  else if (rx_sample_ptr == 4)
+  {
+    rx_frame_error = rx_pin_state != 0;
+  }
+  else
+  {
+    led_on(LOW);
+  }
 
-    // led_on(rx_sample_cnt & 1);
-
-    led_on(HIGH);
-
-    if (rx_sample_ptr == 0)
-    {
-      rx_frame_error = rx_pin_state != 1;
-    }
-    else if (rx_sample_ptr == 2)
-    {
-      rx_byte_msbf = (rx_byte_msbf << 1) | rx_pin_state;
-    }
-    else if (rx_sample_ptr == 4)
-    {
-      rx_frame_error = rx_pin_state != 0;
-    }
-    else
-    {
-      led_on(LOW);
-    }
-
-    if (rx_frame_error || rx_sample_cnt >= ((6 * 8) - 2))
-    {
-      led_on(LOW);
-      rx_sample_enable = false;
-      attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
-      new_rx_char = !rx_frame_error;
-      return;
-    }
+  if (rx_frame_error || rx_sample_cnt >= ((6 * 8) - 2))
+  {
+    led_on(LOW);
+    stopSerialBitTimer();
+    attachSerialPinEdgeInterrupt();
+    new_rx_char = !rx_frame_error;      
   }
 }
 
@@ -114,16 +171,22 @@ void setup()
 {
   Serial.begin(115200);
 
+  #ifdef NRF52840_PROMICRO
+    while (!Serial && millis() < 5000);
+    Serial.println("Running on NRF52840_PROMICRO!");
+    Serial.print("Led pin: ");
+    Serial.println(LED_PIN);
+    Serial.print("Heater serial interface IO pin: ");
+    Serial.println(BW_SERIAL_PIN);
+  #endif
+
   pinMode(OUT_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
-  pinMode(BW_SERIAL_PIN, INPUT);
+  pinMode(BW_SERIAL_PIN, INPUT_PULLUP);
 
-  blueWireSerialTimer = timerBegin(0, 80, true);
-  timerAttachInterrupt(blueWireSerialTimer, &serialBitTimerISR, true);
-  timerAlarmWrite(blueWireSerialTimer, BW_BIT_SAMPLE_DELAY, true);
-  timerAlarmEnable(blueWireSerialTimer);
+  initSerialBitTimer();
 
-  delay(3000);
+  // delay(3000);
   for (int i = 0; i < 6; i++)
   {
     led_on(HIGH);
@@ -133,10 +196,17 @@ void setup()
   }
 
   Serial.println();
-  println_color(COLOR_GREEN, "--==## Diesel Air Heater protocol monitor ##==--");
-  println_color(COLOR_GREEN, "Running in monitor mode.");
+  println_color(COLOR_GREEN, "--==## Diesel Air Heater protocol controller and monitor ##==--");
+  if (monitor_mode) {
+    println_color(COLOR_GREEN, "Running in monitor mode.");
+  } else {
+    println_color(COLOR_YELLOW, "Running in controller mode.");
+  }
 
-  attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
+  restartSerialBitTimer();
+  // delay(100000);
+
+  attachSerialPinEdgeInterrupt();
 }
 
 void send_command(uint8_t command)
@@ -157,7 +227,7 @@ void send_command(uint8_t command)
   digitalWrite(BW_SERIAL_PIN, HIGH);
   pinMode(BW_SERIAL_PIN, INPUT);
 
-  attachInterrupt(BW_SERIAL_PIN, &serialPinEdgeISR, CHANGE);
+  attachSerialPinEdgeInterrupt();
 }
 
 // ----> loop
@@ -165,7 +235,14 @@ unsigned long rx_timeout = 0;
 int no_rx_cnt = 0;
 void loop()
 {
+  // testSerialBitTimer();
+//   Serial.println(bitTimerCount);
+//   delay(1000);
+// }
+
+// void none() {
   unsigned long now = millis();
+
   // Serial.print(".");
 
   // led_on(now % 100 == 0);
@@ -230,7 +307,7 @@ void loop()
     }
   }
 
-  boolean new_frame = rx_process();
+  bool new_frame = rx_process();
   if (new_frame)
   {
     // txrx_ts = now;
@@ -240,7 +317,7 @@ void loop()
   }
 }
 
-boolean rx_process()
+bool rx_process()
 {
   if (new_rx_char)
   {
@@ -286,7 +363,7 @@ void print_frame()
 {
   if (rx_frame_ptr == 3)
   {
-    boolean frame_diff = false;
+    bool frame_diff = false;
     unsigned long now = millis();
     // if (frame_ptr != last_frame_ptr)
     // {
